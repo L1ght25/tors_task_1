@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  master:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: master
+    environment:
+      - ROLE=master
+    networks:
+      - integration_network
+    command: ["./master"]
+
+  worker1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker1
+    environment:
+      - ROLE=worker
+    networks:
+      - integration_network
+    command: ["./worker"]
+
+  worker2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker2
+    environment:
+      - ROLE=worker
+    networks:
+      - integration_network
+    command: ["./worker"]
+
+  worker3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: worker3
+    environment:
+      - ROLE=worker
+    networks:
+      - integration_network
+    command: ["./worker"]
+
+networks:
+  integration_network:
+    driver: bridge
