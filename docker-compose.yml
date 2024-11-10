@@ -11,6 +11,8 @@ services:
     networks:
       - integration_network
     command: ["./master"]
+    ports:
+      - "12233:12233"
 
   worker1:
     build:

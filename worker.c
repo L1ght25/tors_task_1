@@ -24,24 +24,6 @@ double compute_integral(double start, double end) {
     return sum;
 }
 
-// void respond_discovery() {
-//     int sock;
-//     struct sockaddr_in broadcast_addr;
-//     char *msg = "READY";
-
-//     if ((sock = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
-//         perror("socket");
-//         exit(EXIT_FAILURE);
-//     }
-
-//     broadcast_addr.sin_family = AF_INET;
-//     broadcast_addr.sin_port = htons(BROADCAST_PORT);
-//     broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
-
-//     sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
-//     close(sock);
-// }
-
 void *wait_for_discover() {
     int sock;
     struct sockaddr_in server_addr, master_addr;
@@ -135,8 +117,6 @@ void handle_tasks() {
 
             double result = compute_integral(start, end);
             snprintf(buffer, BUFFER_SIZE, "%d %f", segment_ind, result);
-            printf("Sending %s, length %d\n", buffer, recv_len);
-            fflush(stdout);
             send(new_sock, buffer, strlen(buffer), 0);
         }
         close(new_sock);
