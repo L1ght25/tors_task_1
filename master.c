@@ -24,16 +24,12 @@ typedef struct {
 
 typedef struct {
     struct sockaddr_in addr;
-    // int sock;
     int available;
 } Worker;
 
-// typedef struct {
-//     int sock;
-// } AssignedSegment;
-
 Worker workers[NUM_SEGMENTS];
 int num_workers = 0;
+int last_active_worker = -1;
 pthread_mutex_t worker_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void discover_send(int sock, char * msg, struct sockaddr *broadcast_addr, int size_if_broadcast_addr) {
@@ -129,16 +125,18 @@ int send_request_to_worker(Worker *worker, Segment* segments, int ind) {
     return sock;
 }
 
-int assign_segment_to_worker(Segment* segments, int ind) {
+int find_worker(Segment* segments, int ind) {
     int worker_was_found = 0;
-    for (int w = 0; w < num_workers; ++w) {
-        if (!workers[w].available) {
+    for (int w = last_active_worker + 1; w <= last_active_worker + num_workers; ++w) {
+        int curr_worker = w % num_workers;
+        if (!workers[curr_worker].available) {
             continue;
         }
 
-        int sock = send_request_to_worker(&workers[w], segments, ind);
-        if (workers[w].available) {
-            printf("assigned segment %d to worker %d\n", ind, w);
+        int sock = send_request_to_worker(&workers[curr_worker], segments, ind);
+        if (workers[curr_worker].available) {
+            last_active_worker = curr_worker;
+            printf("assigned segment %d to worker %d\n", ind, curr_worker);
             fflush(stdout);
             return sock;
         }
@@ -150,7 +148,7 @@ int assign_segment_to_worker(Segment* segments, int ind) {
 
 int assign_segments(Segment *segments, int *waiters) {
     for (int i = 0; i < NUM_SEGMENTS; ++i) {
-        int worker_sock = assign_segment_to_worker(segments, i);
+        int worker_sock = find_worker(segments, i);
         if (worker_sock == -1) {
             return -1;
         }
@@ -183,11 +181,12 @@ int receive_result(int worker_sock, double *result) {
 
 // Main function
 int main() {
+    sleep(3); // Give workers time to respond
     pthread_t discover_thread;
     pthread_create(&discover_thread, NULL, discover_thread_func, NULL);
 
     // broadcast_discover();
-    sleep(3); // Give workers time to respond
+    sleep(2); // Give workers time to respond
 
     double result = 0;
     double segment_result;
@@ -222,7 +221,7 @@ int main() {
                     waiters[w] = -1;
                     handled_segments++;
                 } else {
-                    int new_sock = assign_segment_to_worker(segments, w);
+                    int new_sock = find_worker(segments, w);
                     if (new_sock == -1) {
                         all_workers_are_dead = 1;
                         break;
