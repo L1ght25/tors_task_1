@@ -6,15 +6,19 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/epoll.h>
 #include <errno.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <poll.h>
 
 #define GATEWAY_PORT 12233
 #define PORT 12345
 #define BROADCAST_PORT 54321
 #define BUFFER_SIZE 1024
 #define NUM_SEGMENTS 10
-#define RESPONSE_TIMEOUT 10
+#define MAX_EVENTS 1024
+#define RESPONSE_TIMEOUT 2
 #define DISCOVER_INTERVAL 10
 
 #define TIMEOUT 5
@@ -47,8 +51,10 @@ void discover_send(int sock, char * msg, struct sockaddr *broadcast_addr, int si
 int worker_exists(struct sockaddr_in from_addr) {
     for (int i = 0; i < NUM_SEGMENTS; ++i) {
         if (workers[i].addr.sin_addr.s_addr == from_addr.sin_addr.s_addr) {
-            printf("WORKER EXISTS ind %d: %s and %s!\n", i, inet_ntoa(workers[i].addr.sin_addr), inet_ntoa(from_addr.sin_addr));
+            printf("WORKER EXISTS ind %d: %s and %s! Setting available\n", i, inet_ntoa(workers[i].addr.sin_addr), inet_ntoa(from_addr.sin_addr));
             fflush(stdout);
+
+            workers[i].available = 1;
             return 1;
         }
     }
@@ -74,8 +80,8 @@ void discover_wait(int sock) {
         // fflush(stdout);
         int recv_len = recvfrom(sock, buffer, BUFFER_SIZE, 0, (struct sockaddr *)&from_addr, &from_len);
         if (recv_len == -1 && errno == EAGAIN) {
-            // printf("timeout...\n");
-            // fflush(stdout);
+            printf("timeout...\n");
+            fflush(stdout);
             return;
         }
         // printf("received!\n");
@@ -121,7 +127,7 @@ void *discover_thread_func() {
 
         // set timeout
         struct timeval tv;
-        tv.tv_sec = TIMEOUT;
+        tv.tv_sec = 1;
         tv.tv_usec = 0;
         if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv) < 0) {
             perror("setsockopt");
@@ -143,6 +149,60 @@ void *discover_thread_func() {
     }
 }
 
+int connect_with_timeout(int sockfd, const struct sockaddr *addr, socklen_t addrlen, unsigned int timeout_ms) {
+    int rc = 0;
+    // Set O_NONBLOCK
+    int sockfd_flags_before;
+    if((sockfd_flags_before=fcntl(sockfd,F_GETFL,0)<0)) return -1;
+    if(fcntl(sockfd,F_SETFL,sockfd_flags_before | O_NONBLOCK)<0) return -1;
+    // Start connecting (asynchronously)
+    do {
+        if (connect(sockfd, addr, addrlen)<0) {
+            // Did connect return an error? If so, we'll fail.
+            if ((errno != EWOULDBLOCK) && (errno != EINPROGRESS)) {
+                rc = -1;
+            }
+            // Otherwise, we'll wait for it to complete.
+            else {
+                // Set a deadline timestamp 'timeout' ms from now (needed b/c poll can be interrupted)
+                struct timespec now;
+                if(clock_gettime(CLOCK_MONOTONIC, &now)<0) { rc=-1; break; }
+                struct timespec deadline = { .tv_sec = now.tv_sec,
+                                             .tv_nsec = now.tv_nsec + timeout_ms*1000000l};
+                // Wait for the connection to complete.
+                do {
+                    // Calculate how long until the deadline
+                    if(clock_gettime(CLOCK_MONOTONIC, &now)<0) { rc=-1; break; }
+                    int ms_until_deadline = (int)(  (deadline.tv_sec  - now.tv_sec)*1000l
+                                                  + (deadline.tv_nsec - now.tv_nsec)/1000000l);
+                    if(ms_until_deadline<0) { rc=0; break; }
+                    // Wait for connect to complete (or for the timeout deadline)
+                    struct pollfd pfds[] = { { .fd = sockfd, .events = POLLOUT } };
+                    rc = poll(pfds, 1, ms_until_deadline);
+                    // If poll 'succeeded', make sure it *really* succeeded
+                    if(rc>0) {
+                        int error = 0; socklen_t len = sizeof(error);
+                        int retval = getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &len);
+                        if(retval==0) errno = error;
+                        if(error!=0) rc=-1;
+                    }
+                }
+                // If poll was interrupted, try again.
+                while(rc==-1 && errno==EINTR);
+                // Did poll timeout? If so, fail.
+                if(rc==0) {
+                    errno = ETIMEDOUT;
+                    rc=-1;
+                }
+            }
+        }
+    } while(0);
+    // Restore original O_NONBLOCK state
+    if(fcntl(sockfd,F_SETFL,sockfd_flags_before)<0) return -1;
+    // Success
+    return rc;
+}
+
 // TCP function to assign work
 int send_request_to_worker(Worker *worker, Segment* segments, int ind) {
     int sock;
@@ -152,22 +212,23 @@ int send_request_to_worker(Worker *worker, Segment* segments, int ind) {
         exit(EXIT_FAILURE);
     }
 
-    // set timeout
-    struct timeval tv;
-    tv.tv_sec = TIMEOUT;
-    tv.tv_usec = 0;
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv) < 0) {
-        perror("setsockopt");
-        close(sock);
-        exit(EXIT_FAILURE);
-    }
+    // // set timeout
+    // struct timeval tv;
+    // tv.tv_sec = TIMEOUT;
+    // tv.tv_usec = 0;
+    // if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv) < 0) {
+    //     perror("setsockopt");
+    //     close(sock);
+    //     exit(EXIT_FAILURE);
+    // }
 
-    if (connect(sock, (struct sockaddr *)&worker->addr, sizeof(worker->addr)) < 0) {
+    if (connect_with_timeout(sock, (struct sockaddr *)&worker->addr, sizeof(worker->addr), TIMEOUT) < 0) {
         perror("connect");
         close(sock);
         printf("WTF, unable to connect\n");
         fflush(stdout);
         worker->available = 0;
+        return -1;
     }
 
     printf("sending request to worker %s\n", inet_ntoa(worker->addr.sin_addr));
@@ -200,23 +261,31 @@ int find_worker(Segment* segments, int ind) {
 }
 
 int assign_segments(Segment *segments, int *waiters) {
+    pthread_mutex_lock(&worker_mutex);
     for (int i = 0; i < NUM_SEGMENTS; ++i) {
+        // already handled
+        if (waiters[i] == -1) {
+            continue;
+        }
+
         int worker_sock = find_worker(segments, i);
         if (worker_sock == -1) {
+            pthread_mutex_unlock(&worker_mutex);
             return -1;
         }
 
         waiters[i] = worker_sock;
     }
 
+    pthread_mutex_unlock(&worker_mutex);
     return 0;
 }
 
-int receive_result(int worker_sock, double *result) {
+int receive_result(int *workers, int sock, double *result) {
     char buffer[BUFFER_SIZE];
 
-    int recv_len = recv(worker_sock, buffer, BUFFER_SIZE, 0);
-    // printf("got buffer: %s, length %d\n", buffer, recv_len);
+    int recv_len = recv(sock, buffer, BUFFER_SIZE, 0);
+    printf("got buffer: %s, length %d\n", buffer, recv_len);
     if (recv_len > 0) {
         buffer[recv_len] = '\0';
         fflush(stdout);
@@ -224,12 +293,87 @@ int receive_result(int worker_sock, double *result) {
         double segment_result;
         sscanf(buffer, "%d %lf", &segment_ind, &segment_result);
         *result += segment_result;
+
+        workers[segment_ind] = -1;
     }
-    // printf("got length %d\n", recv_len);
-    // fflush(stdout);
-    close(worker_sock);
+    printf("got length %d\n", recv_len);
+    fflush(stdout);
 
     return recv_len;
+}
+
+int receive_results_with_epoll(int *worker_sockets, double *result) {
+    int epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) {
+        perror("epoll_create1");
+        exit(EXIT_FAILURE);
+    }
+
+    int handled_segments = 0;
+    struct epoll_event event, events[MAX_EVENTS];
+    for (int i = 0; i < NUM_SEGMENTS; ++i) {
+        if (worker_sockets[i] != -1) {
+            // Добавляем сокеты в kqueue для мониторинга
+            event.data.fd = worker_sockets[i];
+            event.events = EPOLLIN;
+            if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, worker_sockets[i], &event) == -1) {
+                perror("epoll_ctl");
+                close(epoll_fd);
+                return -1;
+            }
+        } else {
+            handled_segments++;
+        }
+    }
+
+    while (handled_segments < NUM_SEGMENTS) {
+        printf("WAITING...: %d\n", handled_segments);
+        fflush(stdout);
+        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, RESPONSE_TIMEOUT * 1000);
+        if (n == -1) {
+            if (errno == EINTR) continue;
+            perror("epoll");
+            break;
+        } else if (n == 0) {
+            // Таймаут истёк
+            printf("epoll timeout: some workers did not respond.\n");
+            break;
+        }
+
+        for (int i = 0; i < n; ++i) {
+            printf("got epoll event, iter %d\n", i);
+            fflush(stdout);
+            int sock = events[i].data.fd;
+
+            if (!(events[i].events & EPOLLIN)) {
+                fprintf(stderr, "EPOLLIN error on socket %d\n", sock);
+            } else {
+                int bytes_readen = receive_result(worker_sockets, sock, result);
+                if (bytes_readen > 0) {
+                    handled_segments++;
+                    printf("HANDLED: %d\n", handled_segments);
+                    fflush(stdout);
+                } else {
+                    // Ошибка чтения или разрыв соединения
+                    perror("recv");
+                }
+            }
+
+            close(sock);
+        }
+    }
+
+    // Закрываем сокеты, которые не успели ответить
+    for (int i = 0; i < NUM_SEGMENTS; ++i) {
+        if (worker_sockets[i] != -1) {
+            printf("Worker socket %d did not respond in time, closing.\n", worker_sockets[i]);
+            close(worker_sockets[i]);
+            // worker_sockets[i] = -1; // Обозначаем как необработанный
+        }
+    }
+
+    close(epoll_fd);
+    return handled_segments == NUM_SEGMENTS ? 0 : -1;
 }
 
 double compute_request(double start, double end) {
@@ -243,52 +387,19 @@ double compute_request(double start, double end) {
         segments[i].end = start + length * (i + 1) / NUM_SEGMENTS;
     }
 
+    int waiters[NUM_SEGMENTS];
     while (1) {
-        pthread_mutex_lock(&worker_mutex);
-
-        int waiters[NUM_SEGMENTS];
         if (assign_segments(segments, waiters) == -1) {
-            printf("No active workers, will retry...\n");
-            exit(1);
-            pthread_mutex_unlock(&worker_mutex);
-            continue;
-        }
-
-        int handled_segments = 0;
-        while (handled_segments != NUM_SEGMENTS) {
-            int all_workers_are_dead = 0;
-            for (int w = 0; w < NUM_SEGMENTS; ++w) {
-                if (waiters[w] == -1) {
-                    continue;
-                }
-
-                int bytes_readen = receive_result(waiters[w], &result);
-                if (bytes_readen > 0) {
-                    waiters[w] = -1;
-                    handled_segments++;
-                } else {
-                    printf("Rerequest segment %d\n", w);
-                    int new_sock = find_worker(segments, w);
-                    if (new_sock == -1) {
-                        all_workers_are_dead = 1;
-                        break;
-                    }
-                    waiters[w] = new_sock;
-                }
-            }
-
-            if (all_workers_are_dead) {
-                printf("No active workers, will retry...\n");
-                break;
-            }
-        }
-
-        if (handled_segments == NUM_SEGMENTS) {
-            pthread_mutex_unlock(&worker_mutex);
+            printf("No active workers, aborting...\n");
+            result = -1;
             break;
         }
 
-        pthread_mutex_unlock(&worker_mutex);
+        if (receive_results_with_epoll(waiters, &result) == 0) {
+            break;
+        }
+
+        printf("Cannot receive, will retry...\n");
     }
 
     return result;
@@ -302,7 +413,7 @@ void handle_local_request(int client_socket) {
         close(client_socket);
         return;
     }
-    
+
     buffer[bytes_received] = '\0'; // Завершаем строку
     printf("Received local request: %s\n", buffer);
 
@@ -323,6 +434,9 @@ void handle_local_request(int client_socket) {
     last_active_worker = -1;
 
     close(client_socket);
+
+    printf("Computed request, closing...: %d\n", client_socket);
+    fflush(stdout);
 }
 
 // Функция для прослушивания локальных запросов

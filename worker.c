@@ -115,6 +115,11 @@ void handle_tasks() {
             double start, end;
             sscanf(buffer, "%d %lf %lf", &segment_ind, &start, &end);
 
+//// for testing
+            if (rand() % 10 == 1) {
+                sleep(20);
+            }
+////
             double result = compute_integral(start, end);
             snprintf(buffer, BUFFER_SIZE, "%d %f", segment_ind, result);
             send(new_sock, buffer, strlen(buffer), 0);
@@ -124,6 +129,7 @@ void handle_tasks() {
 }
 
 int main() {
+    srand(time(NULL));
     pthread_t discover_thread;
     pthread_create(&discover_thread, NULL, wait_for_discover, NULL);
     handle_tasks();
